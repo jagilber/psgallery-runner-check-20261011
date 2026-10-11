@@ -1,0 +1,119 @@
+name: Hosted PowerShell Gallery check
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: hosted-gallery-check
+  cancel-in-progress: false
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-26.04, macos-26-intel]
+        manager: [PowerShellGet, PSResourceGet]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      PACKAGE_MANAGER: ${{ matrix.manager }}
+      REQUESTED_IMAGE: ${{ matrix.os }}
+      AZ_VERSION: 16.4.0
+    steps:
+      - name: Prepare verified PowerShell 7.6.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          mkdir -p "$RUNNER_TEMP/pwsh-7.6.6" "$RUNNER_TEMP/gallery-results"
+          if [ "$RUNNER_OS" = macOS ]; then
+            asset=powershell-7.6.6-osx-x64.tar.gz
+            expected=e325ed9f666894eb39a5ea52800b602da2fb4242bbe9747ceddb39cdc66de805
+          else
+            asset=powershell-7.6.6-linux-x64.tar.gz
+            expected=ddbc4a2d113bbd46d283cfedcbcd117a70caefd7673f41f2b4e0000badf103bc
+          fi
+          curl --fail --location --connect-timeout 20 --max-time 180 --max-filesize 104857600 \
+            --output "$RUNNER_TEMP/pwsh.tar.gz" \
+            "https://github.com/PowerShell/PowerShell/releases/download/v7.6.6/$asset"
+          actual=$(shasum -a 256 "$RUNNER_TEMP/pwsh.tar.gz" | cut -d ' ' -f 1)
+          test "$actual" = "$expected"
+          tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh-7.6.6"
+          chmod +x "$RUNNER_TEMP/pwsh-7.6.6/pwsh"
+          "$RUNNER_TEMP/pwsh-7.6.6/pwsh" --version
+      - name: Install pinned Az and record outcome
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          ulimit -f 524288
+          script="$RUNNER_TEMP/install-check.ps1"
+          cat > "$script" <<'POWERSHELL'
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $root = Join-Path $env:RUNNER_TEMP 'gallery-home'
+          $results = Join-Path $env:RUNNER_TEMP 'gallery-results'
+          $temporary = Join-Path $root 'temp'
+          $modules = Join-Path $root '.local/share/powershell/Modules'
+          [void][IO.Directory]::CreateDirectory($temporary)
+          [void][IO.Directory]::CreateDirectory($modules)
+          $env:HOME = $root
+          $env:TMPDIR = $temporary
+          $env:TEMP = $temporary
+          $env:TMP = $temporary
+          $env:PSModulePath = $modules + [IO.Path]::PathSeparator + (Join-Path $PSHOME 'Modules')
+          $record = [ordered]@{
+            StartUtc = [DateTime]::UtcNow.ToString('o')
+            EndUtc = $null
+            RequestedImage = $env:REQUESTED_IMAGE
+            ImageOS = $env:ImageOS
+            ImageVersion = $env:ImageVersion
+            Os = $PSVersionTable.OS
+            Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+            PowerShell = $PSVersionTable.PSVersion.ToString()
+            Manager = $env:PACKAGE_MANAGER
+            AzVersion = $env:AZ_VERSION
+            RegionSelection = 'No region selected; standard GitHub-hosted placement'
+            PackageManagers = @(Get-Module -ListAvailable PowerShellGet, PackageManagement, Microsoft.PowerShell.PSResourceGet |
+              Select-Object Name, @{Name='Version';Expression={$_.Version.ToString()}})
+            ElapsedSeconds = $null
+            Succeeded = $false
+            Error = $null
+            InstalledModules = @()
+          }
+          $clock = [Diagnostics.Stopwatch]::StartNew()
+          Start-Transcript -LiteralPath (Join-Path $results 'transcript.txt') | Out-Null
+          try {
+            if ($record.PowerShell -ne '7.6.6') { throw 'Runtime pin mismatch' }
+            if ($env:PACKAGE_MANAGER -eq 'PowerShellGet') {
+              Install-Module -Name Az -RequiredVersion $env:AZ_VERSION -Repository PSGallery -AllowClobber -Scope CurrentUser -Force -ErrorAction Stop
+            } elseif ($env:PACKAGE_MANAGER -eq 'PSResourceGet') {
+              Install-PSResource -Name Az -Version $env:AZ_VERSION -Repository PSGallery -Scope CurrentUser -TrustRepository -Reinstall -ErrorAction Stop
+            } else { throw 'Unexpected package manager' }
+            $record.InstalledModules = @(Get-Module -ListAvailable -Name Az, 'Az.*' |
+              Sort-Object Name, Version | Select-Object Name, @{Name='Version';Expression={$_.Version.ToString()}})
+            if (-not ($record.InstalledModules | Where-Object { $_.Name -eq 'Az' -and $_.Version -eq $env:AZ_VERSION })) {
+              throw 'Pinned Az not discoverable after installation'
+            }
+            $record.Succeeded = $true
+          } catch {
+            $record.Error = $_.ToString()
+          } finally {
+            $clock.Stop()
+            $record.ElapsedSeconds = [Math]::Round($clock.Elapsed.TotalSeconds, 6)
+            $record.EndUtc = [DateTime]::UtcNow.ToString('o')
+            $record | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath (Join-Path $results 'summary.json') -Encoding utf8
+            $record | ConvertTo-Json -Depth 7 | Write-Output
+            Stop-Transcript | Out-Null
+          }
+          if (-not $record.Succeeded) { exit 1 }
+          POWERSHELL
+          exec "$RUNNER_TEMP/pwsh-7.6.6/pwsh" -NoLogo -NoProfile -File "$script"
+      - name: Preserve result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: result-${{ matrix.os }}-${{ matrix.manager }}
+          path: ${{ runner.temp }}/gallery-results/
+          retention-days: 2
+          if-no-files-found: error
