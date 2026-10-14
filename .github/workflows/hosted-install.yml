@@ -1,25 +1,48 @@
 name: Hosted PowerShell Gallery check
 on:
   workflow_dispatch:
+    inputs:
+      debug:
+        description: Enable Debug and Verbose on installation and import
+        type: boolean
+        default: false
+      platform:
+        description: Hosted platforms to test
+        type: choice
+        default: both
+        options: [both, macos, linux]
 permissions: {}
 concurrency:
   group: hosted-gallery-check
   cancel-in-progress: false
 jobs:
   install:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [ubuntu-26.04, macos-26-intel]
+        os: ${{ fromJSON(inputs.platform == 'macos' && '["macos-26-intel"]' || inputs.platform == 'linux' && '["ubuntu-26.04"]' || '["ubuntu-26.04","macos-26-intel"]') }}
         manager: [PowerShellGet, PSResourceGet]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 95
     env:
       PACKAGE_MANAGER: ${{ matrix.manager }}
       REQUESTED_IMAGE: ${{ matrix.os }}
       AZ_VERSION: 16.4.0
+      ENABLE_DIAGNOSTICS: ${{ inputs.debug }}
+      LAB_HOME: ${{ runner.temp }}/gallery-home
+      LAB_RESULTS: ${{ runner.temp }}/gallery-results
+      PWSH_PATH: ${{ runner.temp }}/pwsh-7.6.6/pwsh
     steps:
+      - name: Get synthetic lab fixture
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify supervisor guards
+        shell: bash
+        run: node test-supervisor.mjs
       - name: Prepare verified PowerShell 7.6.6
         shell: bash
         run: |
@@ -41,79 +64,18 @@ jobs:
           tar -xzf "$RUNNER_TEMP/pwsh.tar.gz" -C "$RUNNER_TEMP/pwsh-7.6.6"
           chmod +x "$RUNNER_TEMP/pwsh-7.6.6/pwsh"
           "$RUNNER_TEMP/pwsh-7.6.6/pwsh" --version
-      - name: Install pinned Az and record outcome
+      - name: Install and import pinned Az with selected diagnostics
         shell: bash
         run: |
           set -euo pipefail
           ulimit -c 0
           ulimit -f 524288
-          script="$RUNNER_TEMP/install-check.ps1"
-          cat > "$script" <<'POWERSHELL'
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $root = Join-Path $env:RUNNER_TEMP 'gallery-home'
-          $results = Join-Path $env:RUNNER_TEMP 'gallery-results'
-          $temporary = Join-Path $root 'temp'
-          $modules = Join-Path $root '.local/share/powershell/Modules'
-          [void][IO.Directory]::CreateDirectory($temporary)
-          [void][IO.Directory]::CreateDirectory($modules)
-          $env:HOME = $root
-          $env:TMPDIR = $temporary
-          $env:TEMP = $temporary
-          $env:TMP = $temporary
-          $env:PSModulePath = $modules + [IO.Path]::PathSeparator + (Join-Path $PSHOME 'Modules')
-          $record = [ordered]@{
-            StartUtc = [DateTime]::UtcNow.ToString('o')
-            EndUtc = $null
-            RequestedImage = $env:REQUESTED_IMAGE
-            ImageOS = $env:ImageOS
-            ImageVersion = $env:ImageVersion
-            Os = $PSVersionTable.OS
-            Architecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
-            PowerShell = $PSVersionTable.PSVersion.ToString()
-            Manager = $env:PACKAGE_MANAGER
-            AzVersion = $env:AZ_VERSION
-            RegionSelection = 'No region selected; standard GitHub-hosted placement'
-            PackageManagers = @(Get-Module -ListAvailable PowerShellGet, PackageManagement, Microsoft.PowerShell.PSResourceGet |
-              Select-Object Name, @{Name='Version';Expression={$_.Version.ToString()}})
-            ElapsedSeconds = $null
-            Succeeded = $false
-            Error = $null
-            InstalledModules = @()
-          }
-          $clock = [Diagnostics.Stopwatch]::StartNew()
-          Start-Transcript -LiteralPath (Join-Path $results 'transcript.txt') | Out-Null
-          try {
-            if ($record.PowerShell -ne '7.6.6') { throw 'Runtime pin mismatch' }
-            if ($env:PACKAGE_MANAGER -eq 'PowerShellGet') {
-              Install-Module -Name Az -RequiredVersion $env:AZ_VERSION -Repository PSGallery -AllowClobber -Scope CurrentUser -Force -ErrorAction Stop
-            } elseif ($env:PACKAGE_MANAGER -eq 'PSResourceGet') {
-              Install-PSResource -Name Az -Version $env:AZ_VERSION -Repository PSGallery -Scope CurrentUser -TrustRepository -Reinstall -ErrorAction Stop
-            } else { throw 'Unexpected package manager' }
-            $record.InstalledModules = @(Get-Module -ListAvailable -Name Az, 'Az.*' |
-              Sort-Object Name, Version | Select-Object Name, @{Name='Version';Expression={$_.Version.ToString()}})
-            if (-not ($record.InstalledModules | Where-Object { $_.Name -eq 'Az' -and $_.Version -eq $env:AZ_VERSION })) {
-              throw 'Pinned Az not discoverable after installation'
-            }
-            $record.Succeeded = $true
-          } catch {
-            $record.Error = $_.ToString()
-          } finally {
-            $clock.Stop()
-            $record.ElapsedSeconds = [Math]::Round($clock.Elapsed.TotalSeconds, 6)
-            $record.EndUtc = [DateTime]::UtcNow.ToString('o')
-            $record | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath (Join-Path $results 'summary.json') -Encoding utf8
-            $record | ConvertTo-Json -Depth 7 | Write-Output
-            Stop-Transcript | Out-Null
-          }
-          if (-not $record.Succeeded) { exit 1 }
-          POWERSHELL
-          exec "$RUNNER_TEMP/pwsh-7.6.6/pwsh" -NoLogo -NoProfile -File "$script"
+          exec node supervise.mjs
       - name: Preserve result
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: result-${{ matrix.os }}-${{ matrix.manager }}
+          name: result-${{ matrix.os }}-${{ matrix.manager }}-debug-${{ inputs.debug }}
           path: ${{ runner.temp }}/gallery-results/
           retention-days: 2
           if-no-files-found: error
