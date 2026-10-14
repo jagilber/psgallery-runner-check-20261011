@@ -32,9 +32,6 @@ jobs:
       REQUESTED_IMAGE: ${{ matrix.os }}
       AZ_VERSION: 16.4.0
       ENABLE_DIAGNOSTICS: ${{ inputs.debug }}
-      LAB_HOME: ${{ runner.temp }}/gallery-home
-      LAB_RESULTS: ${{ runner.temp }}/gallery-results
-      PWSH_PATH: ${{ runner.temp }}/pwsh-7.6.6/pwsh
     steps:
       - name: Get synthetic lab fixture
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -65,6 +62,10 @@ jobs:
           chmod +x "$RUNNER_TEMP/pwsh-7.6.6/pwsh"
           "$RUNNER_TEMP/pwsh-7.6.6/pwsh" --version
       - name: Install and import pinned Az with selected diagnostics
+        env:
+          LAB_HOME: ${{ runner.temp }}/gallery-home
+          LAB_RESULTS: ${{ runner.temp }}/gallery-results
+          PWSH_PATH: ${{ runner.temp }}/pwsh-7.6.6/pwsh
         shell: bash
         run: |
           set -euo pipefail
